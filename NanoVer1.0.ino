@@ -1,95 +1,134 @@
-/*-------------------------------Arduino code for pulse oximetry-------------------------------
+/*
+  Copyright infomation:
+  Adapted from: Arduino “having11” Guy
+  https://create.arduino.cc/projecthub/gatoninja236/open-source-pulse-oximeter-for-covid-19-4764c5
+  
+  Hardware Connections (Breakoutboard to Arduino):
+  -5V = 5V (3.3V is allowed)
+  -GND = GND
+  -SDA = A4 (or SDA)
+  -SCL = A5 (or SCL)
+  -INT = Not connected
+ 
+  The MAX30105 Breakout can handle 5V or 3.3V I2C logic. We recommend powering the board with 5V
+  but it will also run at 3.3V.
+*/
 
-  [Objective]
-  Develop a functional signal generator and detector on Arduino Nano with the following functions:
-  1. Real-time signal sampling
-  2. Waveform display in serial plotter
+#include <Wire.h>
+#include "MAX30105.h"
+#include "spo2_algorithm.h"
+#include "SSD1306Ascii.h"
+#include "SSD1306AsciiWire.h"
 
----------------------------------------------------------------------------------------------*/
+MAX30105 particleSensor;
+SSD1306AsciiWire oled;
 
-//==========================================================================================//
-//								                1. Variable declaration  							                    //
-//==========================================================================================//
+#define MAX_BRIGHTNESS 255
 
-// Master time control info //
-[......]			 		      // Loop frequency (Hz)
-[......];    		        // Loop period (us)
+#if defined(__AVR_ATmega328P__) || defined(__AVR_ATmega168__)
+//Arduino Uno doesn't have enough SRAM to store 50 samples of IR led data and red led data in 32-bit format
+//To solve this problem, 16-bit MSB of the sampled data will be truncated. Samples become 16-bit data.
+uint16_t irBuffer[50]; //infrared LED sensor data
+uint16_t redBuffer[50];  //red LED sensor data
+#else
+uint32_t irBuffer[50]; //infrared LED sensor data
+uint32_t redBuffer[50];  //red LED sensor data
+#endif
 
-// Signal generation //
-[......]                // ON/OFF of signal generation
-[......]  			 		    // Signal frequency (Hz)
-[......]   		          // No. of samples in a period
-[......]                // Number of output channels (digital ouput)
-[......]                // Loop counter
+int32_t spo2; //SPO2 value
+int8_t validSPO2; //indicator to show if the SPO2 calculation is valid
+int32_t heartRate; //heart rate value
+int8_t validHeartRate; //indicator to show if the heart rate calculation is valid
 
-// Signal detection //
-[......]                // ON/OFF of signal detection
-[......]                // Input analog channel 
-[......]                // Temporal input value
+void setup()
+{
+  Serial.begin(115200); // initialize serial communication at 115200 bits per second:
 
+  oled.begin(&Adafruit128x64, 0x3C);
+  oled.setFont(Arial14);
 
-//==========================================================================================//
-//					                  2. Main program (initialize environment)  			    	       	//
-//==========================================================================================//
-void setup() {
+  // Initialize sensor
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) //Use default I2C port, 400kHz speed
+  {
+    Serial.println(F("MAX30105 was not found. Please check wiring/power."));
+    while (1);
+  }
 
-  // Turn on serial port (baud, bit per second) //
-  [......]
-
-  // Set analog read resolution (bit) //
-  [......]
-
+  particleSensor.setup(55, 4, 2, 200, 411, 4096); //Configure sensor with these settings
 }
 
-//==========================================================================================//
-//							                   3. Main program (looping) 						                		//
-//==========================================================================================//
-void loop() {
+void loop()
+{
 
-  // Set variable to record start time for loop time monitoring (i.e sampling period) //
-  [......]
-    
-  // Using counter to compute the phase of the waveform //
-  [......]
-    
-  //================================== Signal generation ===================================//
+  //read the first 50 samples, and determine the signal range
+  for (byte i = 0 ; i < 50 ; i++)
+  {
+    while (particleSensor.available() == false) //do we have new data?
+      particleSensor.check(); //Check the sensor for new data
 
-  if [......] {   // ON/OFF of signal generation 
+    redBuffer[i] = particleSensor.getRed();
+    irBuffer[i] = particleSensor.getIR();
+    particleSensor.nextSample(); //We're finished with this sample so move to next sample
+    Serial.print(F("red="));
+    Serial.print(redBuffer[i], DEC);
+    Serial.print(F(", ir="));
+    Serial.println(irBuffer[i], DEC);
+  }
 
-    for [......] {    // To generate two signals to two channels 
-    
-      // Output waveform //
-      if (......) {
-      	[......]    // output at digital pin #1
-      }
-      if (......) {
-      	[......]    // output at digital pin #2
-      }
+  //calculate heart rate and SpO2 after first 50 samples (first 4 seconds of samples)
+  maxim_heart_rate_and_oxygen_saturation(irBuffer, 50, redBuffer, &spo2, &validSPO2, &heartRate, &validHeartRate);
 
-      // Print output value to serial port to check waveform in serial plotter //
-      [......]
-
+  //Continuously taking samples from MAX30102.  Heart rate and SpO2 are calculated every 1 second
+  while (1)
+  {
+    //dumping the first 25 sets of samples in the memory and shift the last 25 sets of samples to the top
+    for (byte i = 25; i < 50; i++)
+    {
+      redBuffer[i - 25] = redBuffer[i];
+      irBuffer[i - 25] = irBuffer[i];
     }
 
+    //take 25 sets of samples before calculating the heart rate.
+    for (byte i = 25; i < 50; i++)
+    {
+      while (particleSensor.available() == false) //do we have new data?
+        particleSensor.check(); //Check the sensor for new data
+
+      redBuffer[i] = particleSensor.getRed();
+      irBuffer[i] = particleSensor.getIR();
+      particleSensor.nextSample(); //We're finished with this sample so move to next sample
+      Serial.print(F("red="));
+      Serial.print(redBuffer[i], DEC);
+      Serial.print(F(", ir="));
+      Serial.print(irBuffer[i], DEC);
+
+      Serial.print(F(", HR="));
+      Serial.print(heartRate, DEC);
+
+      Serial.print(F(", HRvalid="));
+      Serial.print(validHeartRate, DEC);
+
+      Serial.print(F(", SPO2="));
+      Serial.print(spo2, DEC);
+
+      Serial.print(F(", SPO2Valid="));
+      Serial.println(validSPO2, DEC);
+      
+    }
+
+    //After gathering 25 new samples recalculate HR and SP02
+    maxim_heart_rate_and_oxygen_saturation(irBuffer, 50, redBuffer, &spo2, &validSPO2, &heartRate, &validHeartRate);
+    printToScreen();
   }
+}
 
-  //================================== Signal detection ===================================//
-  
-  if [......] {   // ON/OFF of signal detection
-    
-    // Sampling at analog channel defined above //
-    [......] 
-  
-    // Print the reading to serial port for visualization //  
-    [......] 
-
+void printToScreen() {
+  oled.clear();
+  oled.setCursor(0,0);
+  if(validSPO2 && validHeartRate) {
+    oled.print(F("HR: ")); oled.println(heartRate, DEC);
+    oled.print(F("SPO2: ")); oled.println(spo2, DEC);
+  } else {
+    oled.print(F("Not valid"));
   }
-
-
-  // Set variable to record end time for loop time monitoring (i.e sampling period) //
-  [......] 
-
-  // Set delay time equal to the difference between start and end times to control loop time //
-  [......] 
-
 }
